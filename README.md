@@ -32,11 +32,8 @@ A modern Web Application Firewall (WAF) with a React-based dashboard for real-ti
 <h2>📁 Project Structure</h2>
 <pre>
 waf/
-  backend_app.py         # (Optional) Flask backend app
   waf_proxy.py           # Main WAF proxy server
   waf_control_api.py     # REST API for WAF control
-  flood.py               # (Utility) Flood testing script
-  loop.py                # (Utility) Automation script
   banned_ips.json        # Persistent banned IPs
   requirements.txt       # Python dependencies
   dashboard/             # React dashboard (frontend)
