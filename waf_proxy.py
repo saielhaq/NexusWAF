@@ -323,17 +323,24 @@ class WAFHandler(BaseHTTPRequestHandler):
                 return
             elif self.path == "/admin/logs":
                 raw_logs = Logger.get_recent_logs()
-                security_logs = [
-                    {
-                        "timestamp": entry.get("timestamp"),
-                        "ip": entry.get("client_ip"),
-                        "eventType": entry.get("event_type"),
-                        "details": entry.get("details", "")
-                    }
-                    for entry in raw_logs
-                    if entry.get("type") == "security_event"
-                ]
-                self.send_json(security_logs)
+                logs = []
+                for entry in raw_logs:
+                    log_type = entry.get("type")
+                    if log_type == "security_event":
+                        logs.append({
+                            "timestamp": entry.get("timestamp"),
+                            "ip": entry.get("client_ip"),
+                            "eventType": entry.get("event_type"),
+                            "details": entry.get("details", "")
+                        })
+                    elif log_type == "ban_event":
+                        logs.append({
+                            "timestamp": entry.get("timestamp"),
+                            "ip": entry.get("client_ip"),
+                            "eventType": "IP_BANNED",
+                            "details": entry.get("reason", "")
+                        })
+                self.send_json(logs)
                 return
             elif self.path.startswith("/admin/unban"):
                 ip = self.path.split("/")[-1]
