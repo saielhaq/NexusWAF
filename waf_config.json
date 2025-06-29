@@ -1,0 +1,6 @@
+{
+  "maxRequests": 5,
+  "timeWindow": 60,
+  "banDuration": 10,
+  "backendUrl": "http://localhost:8000"
+}
