@@ -27,7 +27,7 @@ class Config:
     BANNED_IPS_FILE = "banned_ips.json"
     LOG_FILE = "waf_access.log"
 
-    MAX_REQUESTS = 6
+    MAX_REQUESTS = 100
     TIME_WINDOW = 60
 
     SQL_PATTERNS = [
@@ -81,12 +81,16 @@ class Config:
     ]
 
     PRIVATE_IP_PATTERNS = [
-        r"127\.0\.0\.1",
-        r"localhost",
-        r"169\.254\.",
-        r"10\.",
-        r"192\.168\.",
-        r"172\.(1[6-9]|2[0-9]|3[0-1])\.",
+        r"^127\.",
+        r"^localhost$",
+        r"^169\.254\.",
+        r"^10\.",
+        r"^192\.168\.",
+        r"^172\.(1[6-9]|2[0-9]|3[0-1])\.",
+        r"^0\.",
+        r"^::1$",
+        r"^fc00:",
+        r"^fe80:",
     ]
 
 class SecurityDetector:
@@ -104,13 +108,49 @@ class SecurityDetector:
         return any(re.search(p, path, re.IGNORECASE) for p in patterns)
 
     @staticmethod
-    def detect_ssrf(target_url: str) -> bool:
-        parsed = urlparse(target_url)
+    def detect_ssrf(request_data: str) -> bool:
+        url_patterns = [
+            r"https?://[^\s\"'<>]+",
+            r"url\s*=\s*[\"']?([^\"'\s<>]+)[\"']?",
+            r"target\s*=\s*[\"']?([^\"'\s<>]+)[\"']?",
+            r"host\s*=\s*[\"']?([^\"'\s<>]+)[\"']?",
+            r"server\s*=\s*[\"']?([^\"'\s<>]+)[\"']?",
+        ]
+        
+        for pattern in url_patterns:
+            matches = re.findall(pattern, request_data, re.IGNORECASE)
+            for match in matches:
+                url = match if isinstance(match, str) else match[0] if match else ""
+                if url and SecurityDetector._is_private_target(url):
+                    return True
+        return False
+
+    @staticmethod
+    def _is_private_target(target: str) -> bool:
         try:
-            ip = socket.gethostbyname(parsed.hostname)
-        except socket.gaierror:
+            if not target.startswith(('http://', 'https://')):
+                target = 'http://' + target
+            
+            parsed = urlparse(target)
+            hostname = parsed.hostname
+            
+            if not hostname:
+                return True
+            
+            try:
+                ip = socket.gethostbyname(hostname)
+            except socket.gaierror:
+                return True
+            
+            for pattern in Config.PRIVATE_IP_PATTERNS:
+                if re.match(pattern, ip):
+                    return True
+                if re.match(pattern, hostname):
+                    return True
+            
+            return False
+        except:
             return True
-        return any(re.match(pattern, ip) for pattern in Config.PRIVATE_IP_PATTERNS)
 
 class IPManager:
     def __init__(self):
@@ -169,7 +209,6 @@ class Logger:
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
 
-
 from werkzeug.serving import make_server
 
 class WAFHandler(BaseHTTPRequestHandler):
@@ -195,7 +234,6 @@ class WAFHandler(BaseHTTPRequestHandler):
     def handle_request(self):
         client_ip = self.client_address[0]
 
-        # --- Admin Routes ---
         if self.path.startswith("/admin"):
             if self.path == "/admin/stats":
                 banned_ips_list = list(self.ip_manager.banned_ips)
@@ -233,7 +271,6 @@ class WAFHandler(BaseHTTPRequestHandler):
                 self.send_json({"status": "banned", "ip": ip})
                 return
             elif self.path == "/admin/config" and self.command == "GET":
-                # Load config from file or memory
                 try:
                     with open("waf_config.json", "r") as f:
                         config_data = json.load(f)
@@ -251,12 +288,10 @@ class WAFHandler(BaseHTTPRequestHandler):
                 body_bytes = self.rfile.read(content_length) if content_length > 0 else b''
                 try:
                     config_data = json.loads(body_bytes.decode())
-                    # Update in-memory config
                     Config.MAX_REQUESTS = config_data.get("maxRequests", Config.MAX_REQUESTS)
                     Config.TIME_WINDOW = config_data.get("timeWindow", Config.TIME_WINDOW)
                     setattr(Config, "BAN_DURATION", config_data.get("banDuration", getattr(Config, "BAN_DURATION", 10)))
                     Config.BACKEND_URL = config_data.get("backendUrl", Config.BACKEND_URL)
-                    # Save to file
                     with open("waf_config.json", "w") as f:
                         json.dump(config_data, f)
                     self.send_json({"status": "success", "config": config_data})
@@ -264,7 +299,6 @@ class WAFHandler(BaseHTTPRequestHandler):
                     self.send_error_response(400, f"Invalid config: {e}")
                 return
 
-        # Check if IP is banned (moved after admin routes to allow admin access)
         if self.ip_manager.is_banned(client_ip):
             self.send_error_response(403, "Your IP is banned")
             return
@@ -292,6 +326,11 @@ class WAFHandler(BaseHTTPRequestHandler):
         if self.detector.detect_sql_injection(combined):
             self.logger.log_security_event("SQL_INJECTION", client_ip, combined[:100])
             self.send_error_response(403, "SQL injection detected")
+            return
+
+        if self.detector.detect_ssrf(combined):
+            self.logger.log_security_event("SSRF", client_ip, combined[:100])
+            self.send_error_response(403, "SSRF attack detected")
             return
 
         self.forward_request(body_bytes)
@@ -324,11 +363,7 @@ class WAFHandler(BaseHTTPRequestHandler):
 
     def forward_request(self, body_bytes):
         target_url = Config.BACKEND_URL + self.path
-        if self.detector.detect_ssrf(target_url):
-            self.logger.log_security_event("SSRF", self.client_address[0], target_url)
-            self.send_error_response(403, "SSRF protection triggered")
-            return
-
+        
         try:
             headers = {k: v for k, v in self.headers.items() if k.lower() not in ["connection"]}
             response = requests.request(
@@ -371,13 +406,9 @@ def run_waf_server():
         server.server_close()
         ip_manager.save_banned_ips()
 
-# --- Flask endpoint to proxy to WAFHandler ---
 @app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 def waf_proxy(path):
-    # This endpoint is just a placeholder to allow CORS via Flask.
-    # The actual WAF logic is handled by the HTTPServer running in a separate thread.
-    # You can extend this to forward requests to the HTTPServer if needed.
     return Response("NexusWAF is running", status=200)
 
 def main():
