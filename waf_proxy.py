@@ -7,6 +7,7 @@ import socket
 from typing import Dict, List, Set
 from urllib.parse import unquote, urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime
 
 import requests
 from colorama import Fore, Style, init
@@ -29,6 +30,8 @@ class Config:
 
     MAX_REQUESTS = 100
     TIME_WINDOW = 60
+    MAX_VIOLATIONS = 3
+    VIOLATION_WINDOW = 300
 
     SQL_PATTERNS = [
         r"(?i)\bunion\s+select\b",
@@ -158,6 +161,8 @@ class IPManager:
         self.banned_ips_lock = threading.Lock()
         self.request_log: Dict[str, List[float]] = {}
         self.rate_limit_lock = threading.Lock()
+        self.violations: Dict[str, List[float]] = {}
+        self.violations_lock = threading.Lock()
 
     def load_banned_ips(self):
         try:
@@ -174,28 +179,98 @@ class IPManager:
         return ip in self.banned_ips
 
     def ban_ip(self, ip):
-        self.banned_ips.add(ip)
-        self.save_banned_ips()
+        with self.banned_ips_lock:
+            self.banned_ips.add(ip)
+            self.save_banned_ips()
 
     def unban_ip(self, ip):
-        self.banned_ips.discard(ip)
-        self.save_banned_ips()
+        with self.banned_ips_lock:
+            self.banned_ips.discard(ip)
+            self.save_banned_ips()
 
     def is_rate_limited(self, ip):
         now = time.time()
-        timestamps = self.request_log.get(ip, [])
-        timestamps = [ts for ts in timestamps if now - ts < Config.TIME_WINDOW]
-        if len(timestamps) >= Config.MAX_REQUESTS:
+        with self.rate_limit_lock:
+            timestamps = self.request_log.get(ip, [])
+            timestamps = [ts for ts in timestamps if now - ts < Config.TIME_WINDOW]
+            if len(timestamps) >= Config.MAX_REQUESTS:
+                self.request_log[ip] = timestamps
+                return True
+            timestamps.append(now)
             self.request_log[ip] = timestamps
-            return True
-        timestamps.append(now)
-        self.request_log[ip] = timestamps
-        return False
+            return False
+
+    def record_violation(self, ip):
+        now = time.time()
+        with self.violations_lock:
+            timestamps = self.violations.get(ip, [])
+            timestamps = [ts for ts in timestamps if now - ts < Config.VIOLATION_WINDOW]
+            timestamps.append(now)
+            self.violations[ip] = timestamps
+            
+            if len(timestamps) >= Config.MAX_VIOLATIONS:
+                self.ban_ip(ip)
+                return True
+            return False
 
 class Logger:
     @staticmethod
     def log_security_event(event_type: str, ip: str, details: str = ""):
-        print(f"{Fore.RED}[{event_type}] {ip} - {details}{Style.RESET_ALL}")
+        timestamp = datetime.now().isoformat()
+        log_entry = {
+            "timestamp": timestamp,
+            "type": "security_event",
+            "event_type": event_type,
+            "client_ip": ip,
+            "details": details
+        }
+        
+        print(f"{Fore.RED}[{timestamp}] [{event_type}] {ip} - {details}{Style.RESET_ALL}")
+        
+        try:
+            with open(Config.LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as e:
+            print(f"{Fore.YELLOW}[LOGGING_ERROR] Failed to write to log file: {e}{Style.RESET_ALL}")
+
+    @staticmethod
+    def log_ban_event(ip: str, reason: str = ""):
+        timestamp = datetime.now().isoformat()
+        log_entry = {
+            "timestamp": timestamp,
+            "type": "ban_event",
+            "client_ip": ip,
+            "reason": reason
+        }
+        
+        print(f"{Fore.MAGENTA}[{timestamp}] [IP_BANNED] {ip} - {reason}{Style.RESET_ALL}")
+        
+        try:
+            with open(Config.LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as e:
+            print(f"{Fore.YELLOW}[LOGGING_ERROR] Failed to write to log file: {e}{Style.RESET_ALL}")
+
+    @staticmethod
+    def log_access(ip: str, method: str, path: str, status: int):
+        timestamp = datetime.now().isoformat()
+        log_entry = {
+            "timestamp": timestamp,
+            "type": "access_log",
+            "client_ip": ip,
+            "method": method,
+            "path": path,
+            "status": status
+        }
+        
+        color = Fore.GREEN if status < 400 else Fore.RED
+        print(f"{color}[{timestamp}] [ACCESS] {ip} {method} {path} - {status}{Style.RESET_ALL}")
+        
+        try:
+            with open(Config.LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as e:
+            print(f"{Fore.YELLOW}[LOGGING_ERROR] Failed to write to log file: {e}{Style.RESET_ALL}")
 
     @staticmethod
     def get_recent_logs(limit=50):
@@ -300,10 +375,13 @@ class WAFHandler(BaseHTTPRequestHandler):
                 return
 
         if self.ip_manager.is_banned(client_ip):
+            self.logger.log_access(client_ip, self.command, self.path, 403)
             self.send_error_response(403, "Your IP is banned")
             return
 
         if self.ip_manager.is_rate_limited(client_ip):
+            self.logger.log_security_event("RATE_LIMIT", client_ip, f"Exceeded {Config.MAX_REQUESTS} requests in {Config.TIME_WINDOW}s")
+            self.logger.log_access(client_ip, self.command, self.path, 429)
             self.send_error_response(429, "Too many requests")
             return
 
@@ -315,21 +393,37 @@ class WAFHandler(BaseHTTPRequestHandler):
 
         if self.detector.detect_xss(combined):
             self.logger.log_security_event("XSS", client_ip, combined[:100])
+            auto_banned = self.ip_manager.record_violation(client_ip)
+            if auto_banned:
+                self.logger.log_ban_event(client_ip, "Automatic ban after 3 security violations")
+            self.logger.log_access(client_ip, self.command, self.path, 403)
             self.send_error_response(403, "XSS attack detected")
             return
 
         if self.detector.detect_path_traversal(decoded_path):
             self.logger.log_security_event("PATH_TRAVERSAL", client_ip, decoded_path)
+            auto_banned = self.ip_manager.record_violation(client_ip)
+            if auto_banned:
+                self.logger.log_ban_event(client_ip, "Automatic ban after 3 security violations")
+            self.logger.log_access(client_ip, self.command, self.path, 403)
             self.send_error_response(403, "Path traversal detected")
             return
 
         if self.detector.detect_sql_injection(combined):
             self.logger.log_security_event("SQL_INJECTION", client_ip, combined[:100])
+            auto_banned = self.ip_manager.record_violation(client_ip)
+            if auto_banned:
+                self.logger.log_ban_event(client_ip, "Automatic ban after 3 security violations")
+            self.logger.log_access(client_ip, self.command, self.path, 403)
             self.send_error_response(403, "SQL injection detected")
             return
 
         if self.detector.detect_ssrf(combined):
             self.logger.log_security_event("SSRF", client_ip, combined[:100])
+            auto_banned = self.ip_manager.record_violation(client_ip)
+            if auto_banned:
+                self.logger.log_ban_event(client_ip, "Automatic ban after 3 security violations")
+            self.logger.log_access(client_ip, self.command, self.path, 403)
             self.send_error_response(403, "SSRF attack detected")
             return
 
@@ -362,6 +456,7 @@ class WAFHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode())
 
     def forward_request(self, body_bytes):
+        client_ip = self.client_address[0]
         target_url = Config.BACKEND_URL + self.path
         
         try:
@@ -385,8 +480,11 @@ class WAFHandler(BaseHTTPRequestHandler):
             self.send_cors_headers()
             self.end_headers()
             self.wfile.write(response.content)
+            
+            self.logger.log_access(client_ip, self.command, self.path, response.status_code)
         except Exception as e:
-            self.logger.log_security_event("FORWARD_ERROR", self.client_address[0], str(e))
+            self.logger.log_security_event("FORWARD_ERROR", client_ip, str(e))
+            self.logger.log_access(client_ip, self.command, self.path, 502)
             self.send_error_response(502, "Error forwarding request")
 
 def create_handler(ip_manager):
