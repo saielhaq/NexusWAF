@@ -3,7 +3,6 @@ import { FileText, Filter, RefreshCw } from "lucide-react";
 import { useLogs } from "../hooks/useApi";
 import { LoadingSpinner } from "./LoadingSpinner";
 import { LogEntry } from "../types";
-import { unique } from "lodash";
 
 const EVENT_TYPE_COLORS = {
   RATE_LIMIT_EXCEEDED:
@@ -26,11 +25,16 @@ export function Logs() {
     new Set(logs.map((log) => log.eventType))
   ).sort();
 
-  const filteredLogs = logs.filter((log) => {
-    const matchesType = !filterType || log.eventType === filterType;
-    const matchesIP = !searchIP || log.ip.includes(searchIP);
-    return matchesType && matchesIP;
-  });
+  const filteredLogs = logs
+    .filter((log) => {
+      const matchesType = !filterType || log.eventType === filterType;
+      const matchesIP = !searchIP || log.ip.includes(searchIP);
+      return matchesType && matchesIP;
+    })
+    .sort(
+      (a, b) =>
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
 
   const formatTimestamp = (timestamp: string) => {
     return new Date(timestamp).toLocaleString();
